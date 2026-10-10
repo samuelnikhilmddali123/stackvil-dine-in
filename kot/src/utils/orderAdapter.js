@@ -1,0 +1,186 @@
+// Helper to calculate human readable time ago
+export const getTimeAgo = (dateInput) => {
+  if (!dateInput) return 'Just now';
+  const diffMs = Date.now() - new Date(dateInput).getTime();
+  if (diffMs < 0) return 'Just now';
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return 'Just now';
+  if (mins < 60) return `${mins} min${mins > 1 ? 's' : ''} ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} hr${hours > 1 ? 's' : ''} ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+};
+
+// Helper to calculate elapsed seconds for prep timer
+export const getElapsedSeconds = (dateInput) => {
+  if (!dateInput) return 0;
+  const diffSec = Math.floor((Date.now() - new Date(dateInput).getTime()) / 1000);
+  return diffSec > 0 ? diffSec : 0;
+};
+
+// Check if an order is scheduled for today
+export const isOrderForToday = (order) => {
+  if (!order) return true;
+  if (!order.isPreOrder && !order.pickupDate) return true;
+  if (!order.pickupDate) return true;
+
+  try {
+    const today = new Date();
+    const todayY = today.getFullYear();
+    const todayM = today.getMonth();
+    const todayD = today.getDate();
+
+    let pDate = null;
+    if (typeof order.pickupDate === 'string') {
+      const datePart = order.pickupDate.split('T')[0];
+      const parts = datePart.split('-');
+      if (parts.length === 3 && parts[0].length === 4) {
+        const y = parseInt(parts[0], 10);
+        const m = parseInt(parts[1], 10) - 1;
+        const d = parseInt(parts[2], 10);
+        return y === todayY && m === todayM && d === todayD;
+      }
+      pDate = new Date(order.pickupDate);
+    } else if (order.pickupDate instanceof Date) {
+      pDate = order.pickupDate;
+    }
+
+    if (pDate && !isNaN(pDate.getTime())) {
+      return (
+        pDate.getFullYear() === todayY &&
+        pDate.getMonth() === todayM &&
+        pDate.getDate() === todayD
+      );
+    }
+    return true;
+  } catch (e) {
+    return true;
+  }
+};
+
+// Check if an order is scheduled for a future date (Tomorrow or later)
+export const isOrderFutureDate = (order) => {
+  if (!order || !order.isPreOrder || !order.pickupDate) return false;
+  return !isOrderForToday(order);
+};
+
+// Friendly relative date label for pre-orders (Today, Tomorrow, or DD MMM)
+export const getRelativeDateLabel = (order) => {
+  if (!order || !order.pickupDate) return 'Today';
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    let pDate = null;
+    if (typeof order.pickupDate === 'string') {
+      const datePart = order.pickupDate.split('T')[0];
+      const parts = datePart.split('-');
+      if (parts.length === 3 && parts[0].length === 4) {
+        pDate = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+      } else {
+        pDate = new Date(order.pickupDate);
+      }
+    } else if (order.pickupDate instanceof Date) {
+      pDate = new Date(order.pickupDate.getTime());
+    }
+
+    if (!pDate || isNaN(pDate.getTime())) {
+      return order.pickupDateStr || 'Scheduled';
+    }
+
+    pDate.setHours(0, 0, 0, 0);
+    const diffMs = pDate.getTime() - today.getTime();
+    const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
+
+    if (diffDays === 0) return 'Today';
+    if (diffDays === 1) return 'Tomorrow';
+    if (diffDays > 1) {
+      return pDate.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+    }
+    if (diffDays < 0) return 'Past Date';
+    return pDate.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+  } catch (e) {
+    return order.pickupDateStr || 'Scheduled';
+  }
+};
+
+// Normalize backend status to UI status
+export const mapBackendStatusToUI = (raw) => {
+  if (!raw) return 'prep';
+  const kStatus = (raw.kitchenStatus || '').toUpperCase();
+  const status = (raw.status || '').toUpperCase();
+
+  if (kStatus === 'CANCELLED' || status === 'CANCELLED') {
+    return 'cancelled';
+  }
+  if (kStatus === 'COMPLETED' || status === 'COMPLETED' || status === 'DELIVERED') {
+    return 'completed';
+  }
+  if (kStatus === 'READY' || status === 'READY') {
+    return 'ready';
+  }
+  if (kStatus === 'PREPARING' || status === 'PREPARING') {
+    return 'prep';
+  }
+  if (kStatus === 'ACCEPTED' || status === 'ACCEPTED') {
+    return 'accepted';
+  }
+  if (kStatus === 'NEW' || status === 'NEW' || status === 'PENDING' || status === 'PRE_ORDERED') {
+    return 'new';
+  }
+
+  // Fallback
+  return 'prep';
+};
+
+// Normalize a raw backend order object to UI format
+export const normalizeOrder = (raw) => {
+  if (!raw) return null;
+
+  const uiStatus = mapBackendStatusToUI(raw);
+  const timeAgo = getTimeAgo(raw.createdAt);
+  const timerSec = getElapsedSeconds(raw.createdAt);
+
+  const items = (raw.items || []).map(item => ({
+    qty: item.quantity || item.qty || 1,
+    name: item.name || 'Dish item',
+    price: item.price || 0,
+    spicy: !!item.spicy || (item.name && item.name.toLowerCase().includes('spicy'))
+  }));
+
+  const orderId = raw.id || raw._id || raw.orderNumber || String(Math.floor(Math.random() * 9000) + 1000);
+
+  const isPreOrder = Boolean(raw.isPreOrder || raw.orderType === 'PRE_ORDER' || raw.pickupTime || raw.preOrderSlot);
+  const pickupTime = raw.pickupTime || raw.preOrderSlot || (raw.slot && raw.slot.label) || null;
+  const pickupDateStr = raw.pickupDate
+    ? new Date(raw.pickupDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+    : '';
+
+  return {
+    id: orderId,
+    _id: raw._id || raw.id,
+    orderNumber: raw.orderNumber || (orderId.length > 10 ? `ORD-${orderId.slice(-5)}` : orderId),
+    tokenNumber: raw.tokenNumber || null,
+    userName: raw.userName || raw.customerName || 'Officer',
+    userPhone: raw.userPhone || '',
+    type: isPreOrder ? 'Pre-Order' : (raw.orderType === 'INSTANT' ? 'Instant KOT' : raw.orderType || raw.type || 'Dine In'),
+    isPreOrder,
+    pickupTime,
+    pickupDate: raw.pickupDate || null,
+    pickupDateStr,
+    preOrderSlot: raw.preOrderSlot || pickupTime,
+    table: raw.table || (raw.mealSlot && raw.mealSlot !== 'General' ? `${raw.mealSlot} Slot` : 'Counter Pickup'),
+    items,
+    note: raw.orderNote || raw.note || '',
+    status: uiStatus,
+    rawKitchenStatus: (raw.kitchenStatus || '').toUpperCase(),
+    rawStatus: (raw.status || '').toUpperCase(),
+    timerSeconds: timerSec,
+    startedTimeAgo: uiStatus === 'prep' ? `Cooking · ${timeAgo}` : `Started ${timeAgo}`,
+    readyTimeAgo: uiStatus === 'ready' ? `Ready · ${timeAgo}` : `Ready ${timeAgo}`,
+    timeAgo,
+    totalAmount: raw.totalAmount || raw.grandTotal || 0,
+    paymentStatus: raw.paymentStatus || 'UNPAID',
+    createdAt: raw.createdAt || new Date().toISOString()
+  };
+};

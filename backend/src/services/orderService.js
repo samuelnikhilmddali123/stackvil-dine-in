@@ -1,0 +1,675 @@
+const dataStore = require('../storage/dataStore');
+const Order = require('../models/Order');
+const Food = require('../models/Food');
+const User = require('../models/User');
+const mongoose = require('mongoose');
+const QRCode = require('qrcode');
+
+const RESTAURANT_UPI_ID = process.env.RESTAURANT_UPI_ID || 'canteen.services@gov';
+const RESTAURANT_NAME = process.env.RESTAURANT_NAME || 'Canteen Services GOI';
+
+function formatOrderDoc(doc) {
+  if (!doc) return null;
+  const obj = doc.toObject ? doc.toObject() : { ...doc };
+  let avatar = obj.userAvatar || (obj.user && obj.user.avatar) || '';
+  if (!avatar && (obj.userId || obj.userPhone)) {
+    try {
+      const cleanPhone = (obj.userPhone || '').replace(/\D/g, '').slice(-10);
+      const allUsers = dataStore.getUsers ? dataStore.getUsers() : (dataStore.find ? dataStore.find('users', () => true) : []);
+      const user = (allUsers || []).find(u => {
+        const uPhone = (u.phone || '').replace(/\D/g, '').slice(-10);
+        return (cleanPhone && uPhone && cleanPhone === uPhone) ||
+               (obj.userId && (String(u.id) === String(obj.userId) || String(u._id) === String(obj.userId)));
+      });
+      if (user && user.avatar) {
+        avatar = user.avatar;
+      }
+    } catch (e) {}
+  }
+  return {
+    id: String(obj._id || obj.id),
+    _id: obj._id || obj.id,
+    orderNumber: obj.orderNumber,
+    userId: obj.userId || (obj.user && String(obj.user._id || obj.user)) || 'guest',
+    userName: obj.userName || 'IAS Officer',
+    userPhone: obj.userPhone || '',
+    userAvatar: avatar,
+    orderType: obj.orderType || 'INSTANT',
+    isPreOrder: (obj.orderType === 'PRE_ORDER' || Boolean(obj.isPreOrder) || Boolean(obj.pickupTime)),
+    pickupDate: obj.pickupDate ? new Date(obj.pickupDate) : null,
+    pickupTime: obj.pickupTime || null,
+    slotId: obj.slotId || null,
+    preOrderSlot: obj.preOrderSlot || obj.pickupTime || null,
+    mealSlot: obj.mealSlot || 'General',
+    items: Array.isArray(obj.items) ? obj.items.map(item => ({
+      foodId: item.foodId || item.id || '',
+      id: item.id || item.foodId || '',
+      name: item.name || (item.item && item.item.name) || 'Food item',
+      quantity: item.quantity || 1,
+      price: item.price || (item.item && item.item.price) || 0,
+      total: (item.quantity || 1) * (item.price || (item.item && item.item.price) || 0),
+      image: item.image || (item.item && item.item.image) || ''
+    })) : [],
+    subtotal: Number(obj.subtotal || obj.totalAmount) || 0,
+    totalAmount: Number(obj.totalAmount || obj.subtotal) || 0,
+    grandTotal: Number(obj.grandTotal || obj.totalAmount || obj.subtotal) || 0,
+    paymentMethod: obj.paymentMethod || 'online',
+    paymentStatus: obj.paymentStatus || 'UNPAID',
+    orderNote: obj.orderNote || '',
+    mealSlot: obj.mealSlot || 'General',
+    status: obj.status || 'NEW',
+    kitchenStatus: obj.kitchenStatus || 'NEW',
+    tokenNumber: obj.tokenNumber || Math.floor(10 + Math.random() * 90),
+    billNumber: obj.billNumber || null,
+    createdAt: obj.createdAt
+  };
+}
+
+const createOrder = async (orderData) => {
+  if (!orderData.items || !Array.isArray(orderData.items) || orderData.items.length === 0) {
+    const error = new Error('Order must contain at least one item');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const orderNumber = orderData.orderNumber || ('ORD-' + new Date().getFullYear() + '-' + Math.floor(10000 + Math.random() * 90000));
+  const tokenNumber = orderData.tokenNumber || Math.floor(10 + Math.random() * 90);
+
+  // Security Rule: Validate and compute order total on backend using authenticated user isOfficial status and catalog food prices.
+  const targetUserId = orderData.userId || (orderData.user && (orderData.user.id || String(orderData.user._id)));
+  const targetUserPhone = orderData.userPhone || (orderData.user && orderData.user.phone) || '';
+  
+  const authService = require('./authService');
+  let foundUser = null;
+  if (targetUserId && targetUserId !== 'guest') {
+    try { foundUser = await authService.getUserById(targetUserId); } catch (e) {}
+  }
+  if (!foundUser && targetUserPhone) {
+    try { foundUser = await authService.getUserByPhone(targetUserPhone); } catch (e) {}
+  }
+
+  const isOfficialUser = Boolean(foundUser && foundUser.isOfficial);
+
+  let foodsCatalog = [];
+  if (mongoose.connection.readyState === 1) {
+    try {
+      foodsCatalog = await Food.find();
+    } catch (e) {
+      console.warn('[ORDER] Food price lookup warning:', e.message);
+    }
+  }
+  if (!foodsCatalog || foodsCatalog.length === 0) {
+    foodsCatalog = dataStore.getFoods ? dataStore.getFoods() : [];
+  }
+
+  const foodPriceMap = new Map();
+  foodsCatalog.forEach(f => {
+    const generalPrice = Number(f.price) || 0;
+    let officialPrice = Number(f.officialPrice);
+    if (isNaN(officialPrice) || officialPrice <= 0) {
+      officialPrice = generalPrice > 0 ? Math.max(1, Math.round(generalPrice * 0.85)) : 0;
+    }
+    const appliedPrice = isOfficialUser ? officialPrice : generalPrice;
+
+    if (f.id) foodPriceMap.set(String(f.id), appliedPrice);
+    if (f._id) foodPriceMap.set(String(f._id), appliedPrice);
+    if (f.name) foodPriceMap.set(f.name.toLowerCase().trim(), appliedPrice);
+  });
+
+  let calculatedSubtotal = 0;
+  const formattedItems = orderData.items.map(item => {
+    const qty = Math.max(1, Number(item.quantity) || 1);
+    const idKey = String(item.foodId || item.id || (item.item && (item.item.id || item.item._id)) || '');
+    const nameKey = String(item.name || (item.item && item.item.name) || '').toLowerCase().trim();
+
+    let unitPrice = 0;
+    if (idKey && foodPriceMap.has(idKey)) {
+      unitPrice = foodPriceMap.get(idKey);
+    } else if (nameKey && foodPriceMap.has(nameKey)) {
+      unitPrice = foodPriceMap.get(nameKey);
+    } else {
+      unitPrice = Number(item.price || (item.item && item.item.price)) || 0;
+    }
+
+    const itemTotal = qty * unitPrice;
+    calculatedSubtotal += itemTotal;
+
+    return {
+      foodId: idKey,
+      id: idKey,
+      name: item.name || (item.item && item.item.name) || 'Food item',
+      quantity: qty,
+      price: unitPrice,
+      total: itemTotal,
+      image: item.image || (item.item && item.item.image) || ''
+    };
+  });
+
+  const subtotal = calculatedSubtotal;
+  const totalAmount = calculatedSubtotal;
+
+  let resolvedUserName = orderData.userName || (orderData.user && orderData.user.name) || '';
+  let resolvedUserPhone = orderData.userPhone || (orderData.user && orderData.user.phone) || '';
+  let resolvedUserAvatar = orderData.userAvatar || (orderData.user && orderData.user.avatar) || '';
+
+  if (foundUser) {
+    if (foundUser.name) resolvedUserName = foundUser.name;
+    if (!resolvedUserPhone && (foundUser.phone || foundUser.mobile)) resolvedUserPhone = foundUser.phone || foundUser.mobile;
+    if (!resolvedUserAvatar && foundUser.avatar) resolvedUserAvatar = foundUser.avatar;
+  }
+  if (!resolvedUserName) resolvedUserName = 'IAS Officer';
+
+  const isPreOrder = (String(orderData.orderType || '').toUpperCase() === 'PRE_ORDER' || String(orderData.orderType || '').toLowerCase() === 'later' || Boolean(orderData.pickupTime) || Boolean(orderData.isPreOrder) || Boolean(orderData.slotId));
+  const orderType = isPreOrder ? 'PRE_ORDER' : (orderData.orderType || 'INSTANT');
+  const pickupTime = orderData.pickupTime || orderData.preOrderSlot || (orderData.slot && orderData.slot.label) || null;
+  const pickupDate = orderData.pickupDate ? new Date(orderData.pickupDate) : (pickupTime || isPreOrder ? new Date() : null);
+  const slotId = orderData.slotId || (orderData.slot && orderData.slot.id) || null;
+  const preOrderSlot = orderData.preOrderSlot || pickupTime || (orderData.slot && orderData.slot.label) || null;
+  const mealSlot = orderData.mealSlot || (orderData.slot && orderData.slot.mealSlot) || 'General';
+
+  const orderPayload = {
+    orderNumber,
+    userId: targetUserId || 'guest',
+    userName: resolvedUserName,
+    userPhone: resolvedUserPhone,
+    userAvatar: resolvedUserAvatar,
+    items: formattedItems,
+    subtotal,
+    totalAmount,
+    grandTotal: totalAmount,
+    paymentMethod: orderData.paymentMethod || 'online',
+    paymentStatus: orderData.paymentStatus || 'UNPAID',
+    orderType,
+    isPreOrder,
+    pickupDate,
+    pickupTime,
+    slotId,
+    preOrderSlot,
+    orderNote: orderData.orderNote || '',
+    mealSlot,
+    status: isPreOrder ? 'PRE_ORDERED' : (orderData.status || 'NEW'),
+    kitchenStatus: 'NEW',
+    tokenNumber
+  };
+
+  let savedOrder = null;
+
+  // Primary: Save in MongoDB
+  if (mongoose.connection.readyState === 1) {
+    try {
+      const isUserObjectId = mongoose.Types.ObjectId.isValid(orderPayload.userId);
+      const mongoOrder = await Order.create({
+        ...orderPayload,
+        ...(isUserObjectId ? { user: orderPayload.userId } : {})
+      });
+      savedOrder = formatOrderDoc(mongoOrder);
+    } catch (e) {
+      console.warn('[ORDER] MongoDB createOrder warning:', e.message);
+    }
+  }
+
+  // Dual-store synchronization
+  const jsonOrder = dataStore.saveOrder({
+    ...orderPayload,
+    id: 'ord-' + Date.now()
+  });
+
+  const finalOrder = savedOrder || jsonOrder;
+
+  // Auto-dispatch thermal KOT print for instant & prebooking orders
+  try {
+    const printerService = require('../utils/printerService');
+    if (printerService && printerService.printOrderBackend) {
+      printerService.printOrderBackend(finalOrder).catch(err => {
+        console.warn('[PRINTER] Auto-print warning:', err.message);
+      });
+    }
+  } catch (pe) {
+    console.warn('[PRINTER] Printer service invocation warning:', pe.message);
+  }
+
+  // Emit KOT event to kitchen via Socket.io in real-time
+  try {
+    const serverModule = require('../../server');
+    const io = serverModule.io || (serverModule.getIO && serverModule.getIO());
+    if (io) {
+      const kotPayload = {
+        orderNumber: finalOrder.orderNumber,
+        tokenNumber: finalOrder.tokenNumber,
+        customerName: finalOrder.userName || 'IAS Officer',
+        userName: finalOrder.userName || 'IAS Officer',
+        userPhone: finalOrder.userPhone || '',
+        foodItemNames: (finalOrder.items || []).map(i => i.name),
+        items: finalOrder.items,
+        orderNote: finalOrder.orderNote || '',
+        orderCreationTime: finalOrder.createdAt,
+        orderTime: finalOrder.createdAt,
+        isPreOrder: finalOrder.isPreOrder,
+        pickupTime: finalOrder.pickupTime || finalOrder.preOrderSlot || null,
+        pickupDate: finalOrder.pickupDate || null,
+        slotId: finalOrder.slotId || null,
+        preOrderSlot: finalOrder.preOrderSlot || finalOrder.pickupTime || null,
+        mealSlot: finalOrder.mealSlot || 'General',
+        orderType: finalOrder.orderType || (finalOrder.isPreOrder ? 'PRE_ORDER' : 'INSTANT'),
+        kitchenStatus: finalOrder.kitchenStatus || 'NEW',
+        status: finalOrder.status
+      };
+
+      io.emit('newKOT', kotPayload);
+      io.of('/kitchen').emit('newKOT', kotPayload);
+      io.emit('preOrderCreated', kotPayload);
+      io.emit('newOrder', finalOrder);
+      console.log(`[KOT] Dispatched live ticket for Order #${finalOrder.orderNumber} (Type: ${finalOrder.orderType}, Slot: ${finalOrder.pickupTime || 'N/A'})`);
+    }
+  } catch (e) {
+    console.warn('[KOT] Failed to emit newKOT event:', e.message);
+  }
+
+  return finalOrder;
+};
+
+const getUserOrders = async (userIdOrPhone) => {
+  if (!userIdOrPhone) {
+    return getAllOrdersForAdmin();
+  }
+
+  const str = String(userIdOrPhone).trim();
+  const cleanPhone = str.replace(/\D/g, '').slice(-10);
+
+  if (mongoose.connection.readyState === 1) {
+    try {
+      const isObjectId = mongoose.Types.ObjectId.isValid(str);
+      const userPhones = [str];
+      if (cleanPhone) userPhones.push(cleanPhone);
+
+      // If str is a valid user ObjectId, also retrieve the user document to grab associated phone numbers
+      if (isObjectId) {
+        try {
+          const userDoc = await User.findById(str);
+          if (userDoc && userDoc.phone) {
+            userPhones.push(userDoc.phone);
+            const pClean = userDoc.phone.replace(/\D/g, '').slice(-10);
+            if (pClean) userPhones.push(pClean);
+          }
+        } catch {}
+      }
+
+      const query = {
+        $or: [
+          { userId: str },
+          ...(isObjectId ? [{ user: str }] : []),
+          ...userPhones.map(p => ({ userPhone: p })),
+          ...(cleanPhone ? [{ userPhone: new RegExp(cleanPhone + '$') }] : [])
+        ]
+      };
+
+      const orders = await Order.find(query).sort({ createdAt: -1 });
+      return orders.map(formatOrderDoc);
+    } catch (e) {
+      console.warn('[ORDER] MongoDB getUserOrders error:', e.message);
+    }
+  }
+
+  const isPhone = /^\+?[0-9\s-]{7,}$/.test(str);
+  if (isPhone) {
+    return dataStore.getOrders({ phone: str });
+  }
+  return dataStore.getOrders({ userId: str });
+};
+
+const getOrderById = async (orderId) => {
+  if (!orderId) {
+    const error = new Error('Order ID is required');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (mongoose.connection.readyState === 1) {
+    try {
+      const isObjectId = mongoose.Types.ObjectId.isValid(orderId);
+      const order = await Order.findOne({
+        $or: [
+          ...(isObjectId ? [{ _id: orderId }] : []),
+          { orderNumber: orderId }
+        ]
+      });
+      if (order) return formatOrderDoc(order);
+    } catch (e) {
+      console.warn('[ORDER] MongoDB getOrderById fallback:', e.message);
+    }
+  }
+
+  const order = dataStore.getOrderById(orderId);
+  if (!order) {
+    const error = new Error('Order not found');
+    error.statusCode = 404;
+    throw error;
+  }
+  return order;
+};
+
+const getAllOrdersForAdmin = async (filter = {}) => {
+  if (mongoose.connection.readyState === 1) {
+    try {
+      const query = {};
+      if (filter.status) {
+        query.status = filter.status;
+      }
+      if (filter.userId) {
+        query.userId = filter.userId;
+      }
+      if (filter.phone) {
+        const clean = String(filter.phone).replace(/\D/g, '').slice(-10);
+        query.userPhone = new RegExp(clean + '$');
+      }
+
+      const orders = await Order.find(query).sort({ createdAt: -1 });
+      if (orders && orders.length > 0) {
+        return orders.map(formatOrderDoc);
+      }
+    } catch (e) {
+      console.warn('[ORDER] MongoDB getAllOrdersForAdmin fallback:', e.message);
+    }
+  }
+
+  return dataStore.getOrders(filter);
+};
+
+const VALID_TRANSITIONS = {
+  'NEW': ['ACCEPTED', 'PREPARING', 'READY', 'COMPLETED', 'CANCELLED'],
+  'PENDING': ['ACCEPTED', 'PREPARING', 'READY', 'COMPLETED', 'CANCELLED'],
+  'PRE_ORDERED': ['ACCEPTED', 'PREPARING', 'READY', 'COMPLETED', 'CANCELLED'],
+  'ACCEPTED': ['PREPARING', 'READY', 'COMPLETED', 'CANCELLED'],
+  'PREPARING': ['READY', 'COMPLETED', 'CANCELLED'],
+  'READY': ['COMPLETED', 'PREPARING', 'CANCELLED'],
+  'COMPLETED': ['READY', 'PREPARING', 'CANCELLED'],
+  'CANCELLED': ['NEW', 'PREPARING']
+};
+
+const updateOrderStatus = async (orderId, status) => {
+  if (!orderId || !status) {
+    const error = new Error('Order ID and status are required');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const targetStatus = status.toUpperCase().trim();
+  let existingOrder = null;
+  try {
+    existingOrder = await getOrderById(orderId);
+  } catch (e) {
+    existingOrder = { status: 'PREPARING', kitchenStatus: 'PREPARING' };
+  }
+  const currentStatus = (existingOrder.kitchenStatus || existingOrder.status || 'NEW').toUpperCase().trim();
+
+  // Validate state transitions (Requirement 4 & 18: NEW -> ACCEPTED -> PREPARING -> READY -> COMPLETED)
+  if (currentStatus !== targetStatus) {
+    const allowed = VALID_TRANSITIONS[currentStatus];
+    if (allowed && !allowed.includes(targetStatus)) {
+      const error = new Error(
+        `Invalid status transition from ${currentStatus} to ${targetStatus}. Expected next status: ${allowed.join(' or ') || 'None (order finalized)'}`
+      );
+      error.statusCode = 400;
+      throw error;
+    }
+  }
+
+  let updatedOrder = null;
+  const updateFields = {
+    status: targetStatus,
+    kitchenStatus: targetStatus,
+    updatedAt: new Date()
+  };
+
+  // Requirement 5: When admin changes READY -> COMPLETED, backend must automatically make order paymentStatus: UNPAID
+  if (targetStatus === 'COMPLETED') {
+    updateFields.paymentStatus = 'UNPAID';
+  }
+
+  if (mongoose.connection.readyState === 1) {
+    try {
+      const isObjectId = mongoose.Types.ObjectId.isValid(orderId);
+      const mongoOrder = await Order.findOneAndUpdate(
+        {
+          $or: [
+            ...(isObjectId ? [{ _id: orderId }] : []),
+            { orderNumber: orderId }
+          ]
+        },
+        { $set: updateFields },
+        { returnDocument: 'after' }
+      );
+      if (mongoOrder) {
+        updatedOrder = formatOrderDoc(mongoOrder);
+      }
+    } catch (e) {
+      console.warn('[ORDER] MongoDB updateOrderStatus warning:', e.message);
+    }
+  }
+
+  const jsonOrder = dataStore.updateOrderStatus(orderId, targetStatus);
+  if (jsonOrder && targetStatus === 'COMPLETED') {
+    jsonOrder.paymentStatus = 'UNPAID';
+  }
+  if (!updatedOrder && !jsonOrder) {
+    const error = new Error('Order not found');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const finalOrder = updatedOrder || jsonOrder;
+
+  // Real-time broadcast to all connected clients and kitchen displays (Requirement 5 & 6)
+  try {
+    const serverModule = require('../../server');
+    const io = serverModule.io || (serverModule.getIO && serverModule.getIO());
+    if (io) {
+      io.emit('orderStatusUpdated', finalOrder);
+      io.emit('orderUpdated', finalOrder);
+      io.of('/kitchen').emit('orderStatusUpdated', finalOrder);
+      console.log(`[Socket.IO] Broadcasted orderStatusUpdated for #${finalOrder.orderNumber}: ${currentStatus} -> ${targetStatus}`);
+    }
+  } catch (sockErr) {
+    console.warn('[ORDER] Socket.IO broadcast warning:', sockErr.message);
+  }
+
+  return finalOrder;
+};
+
+const getAdminStats = async () => {
+  if (mongoose.connection.readyState === 1) {
+    try {
+      const orders = await Order.find();
+      const foods = await Food.find();
+      const users = await User.find();
+
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const todayOrders = orders.filter(o => o.createdAt && o.createdAt.toISOString().startsWith(todayStr));
+
+      const totalRevenue = orders.reduce((sum, o) => sum + (Number(o.totalAmount || o.grandTotal) || 0), 0);
+      const todayRevenue = todayOrders.reduce((sum, o) => sum + (Number(o.totalAmount || o.grandTotal) || 0), 0);
+      const activeOrders = orders.filter(o => o.status === 'PENDING' || o.status === 'PREPARING');
+
+      const categoryCounts = {
+        breakfast: foods.filter(f => (f.category || '').toLowerCase() === 'breakfast').length,
+        lunch: foods.filter(f => (f.category || '').toLowerCase() === 'lunch').length,
+        dinner: foods.filter(f => (f.category || '').toLowerCase() === 'dinner').length,
+        snacks: foods.filter(f => (f.category || '').toLowerCase() === 'snacks').length,
+      };
+
+      return {
+        totalRevenue,
+        todayRevenue,
+        totalOrdersCount: orders.length,
+        todayOrdersCount: todayOrders.length,
+        activeOrdersCount: activeOrders.length,
+        totalFoodsCount: foods.length,
+        totalOfficersCount: users.length,
+        categoryCounts
+      };
+    } catch (e) {
+      console.warn('[ORDER] MongoDB getAdminStats fallback:', e.message);
+    }
+  }
+
+  return dataStore.getAdminStats();
+};
+
+const updatePaymentStatus = async (orderId, paymentStatus) => {
+  if (!orderId || !paymentStatus) {
+    const error = new Error('Order ID and paymentStatus are required');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const validStatuses = ['UNPAID', 'PAYMENT_PENDING', 'PAID'];
+  if (!validStatuses.includes(paymentStatus)) {
+    const error = new Error(`Invalid payment status. Must be one of: ${validStatuses.join(', ')}`);
+    error.statusCode = 400;
+    throw error;
+  }
+
+  let updatedOrder = null;
+
+  if (mongoose.connection.readyState === 1) {
+    try {
+      const isObjectId = mongoose.Types.ObjectId.isValid(orderId);
+      const mongoOrder = await Order.findOneAndUpdate(
+        {
+          $or: [
+            ...(isObjectId ? [{ _id: orderId }] : []),
+            { orderNumber: orderId }
+          ]
+        },
+        { $set: { paymentStatus, updatedAt: new Date() } },
+        { returnDocument: 'after' }
+      );
+      if (mongoOrder) {
+        updatedOrder = formatOrderDoc(mongoOrder);
+      }
+    } catch (e) {
+      console.warn('[ORDER] MongoDB updatePaymentStatus warning:', e.message);
+    }
+  }
+
+  const jsonOrder = dataStore.updatePaymentStatus ? dataStore.updatePaymentStatus(orderId, paymentStatus) : null;
+  if (!updatedOrder && !jsonOrder) {
+    const error = new Error('Order not found');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const finalOrder = updatedOrder || jsonOrder;
+
+  // Real-time broadcast to all connected clients and kitchen displays
+  try {
+    const serverModule = require('../../server');
+    const io = serverModule.io || (serverModule.getIO && serverModule.getIO());
+    if (io) {
+      io.emit('orderStatusUpdated', finalOrder);
+      io.emit('orderUpdated', finalOrder);
+      io.of('/kitchen').emit('orderStatusUpdated', finalOrder);
+      if (finalOrder.paymentStatus === 'PAID') {
+        const ordId = String(finalOrder._id || finalOrder.id || finalOrder.orderNumber);
+        const payPayload = {
+          orderId: ordId,
+          id: ordId,
+          _id: finalOrder._id || finalOrder.id,
+          orderNumber: finalOrder.orderNumber,
+          tokenNumber: finalOrder.tokenNumber,
+          userName: finalOrder.userName,
+          paymentStatus: 'PAID',
+          isPaid: true,
+          totalAmount: finalOrder.totalAmount,
+          items: finalOrder.items,
+          billUrl: `/api/orders/${ordId}/bill-html`
+        };
+        io.emit('printPaidBill', payPayload);
+        io.emit('orderPaid', payPayload);
+        io.emit('paymentSuccess', payPayload);
+        io.of('/kitchen').emit('printPaidBill', payPayload);
+        io.of('/kitchen').emit('orderPaid', payPayload);
+        io.of('/kitchen').emit('paymentSuccess', payPayload);
+      }
+      console.log(`[Socket.IO] Broadcasted paymentStatus for #${finalOrder.orderNumber}: ${finalOrder.paymentStatus}`);
+    }
+  } catch (sockErr) {
+    console.warn('[ORDER] Socket.IO payment broadcast warning:', sockErr.message);
+  }
+
+  return finalOrder;
+};
+
+const getUnpaidOrders = async (userIdOrPhone) => {
+  const allUserOrders = await getUserOrders(userIdOrPhone);
+  const unpaid = (allUserOrders || []).filter(o => o.paymentStatus === 'UNPAID' || o.paymentStatus === 'PAYMENT_PENDING');
+  const totalOutstanding = unpaid.reduce((sum, o) => sum + (Number(o.totalAmount || o.grandTotal) || 0), 0);
+  return {
+    orders: unpaid,
+    totalOutstanding,
+    count: unpaid.length
+  };
+};
+
+const getRestaurantPaymentQr = async (amount = 0, orderIds = []) => {
+  const numAmount = Number(amount) || 0;
+  const upiId = RESTAURANT_UPI_ID;
+  const payeeName = RESTAURANT_NAME;
+
+  // Standard UPI payment URI format
+  const upiPayload = `upi://pay?pa=${upiId}&pn=${encodeURIComponent(payeeName)}${numAmount > 0 ? `&am=${numAmount.toFixed(2)}` : ''}&cu=INR&tn=${encodeURIComponent('Canteen Food Orders Settlement')}`;
+
+  const qrDataUrl = await QRCode.toDataURL(upiPayload, {
+    errorCorrectionLevel: 'H',
+    margin: 2,
+    scale: 8,
+    color: {
+      dark: '#0a3d31', // Government Forest Green
+      light: '#ffffff'
+    }
+  });
+
+  return {
+    qrDataUrl,
+    upiPayload,
+    upiId,
+    payeeName,
+    amount: numAmount,
+    orderIds,
+    paymentInstructions: 'Scan using Google Pay, PhonePe, Paytm, BHIM or any UPI app to pay the canteen counter.'
+  };
+};
+
+
+const getLiveOrders = async () => {
+  if (mongoose.connection.readyState === 1) {
+    try {
+      const Order = require('../models/Order');
+      const orders = await Order.find({ status: { $in: ['NEW', 'ACCEPTED', 'PREPARING', 'READY'] } })
+                                .sort({ createdAt: -1 })
+                                .limit(6);
+      return orders.map(formatOrderDoc);
+    } catch (e) {
+      console.warn('[ORDER] MongoDB getLiveOrders error:', e.message);
+    }
+  }
+
+  const allOrders = dataStore.getOrders ? dataStore.getOrders() : (dataStore.find ? dataStore.find('orders', () => true) : []);
+  const active = (allOrders || []).filter(o => ['NEW', 'ACCEPTED', 'PREPARING', 'READY'].includes(o.status));
+  active.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  return active.slice(0, 6).map(formatOrderDoc);
+};
+
+module.exports = {
+  createOrder,
+  getUserOrders,
+  getOrderById,
+  getAllOrdersForAdmin,
+  updateOrderStatus,
+  updatePaymentStatus,
+  getUnpaidOrders,
+  getRestaurantPaymentQr,
+  getAdminStats,
+  getLiveOrders
+};
+

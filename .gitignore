@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+kot/node_modules/
+frontend/node_modules/
+backend/node_modules/
+
+# Generated QR files
+backend/uploads/qr/
+
+# Baileys session/auth files
+backend/data/baileys_auth_info/
+
+# Temporary diff file
+diff.txt
+
+# Scratch and test files
+scratch/
+*.exe
+*.crdownload
+
+__pycache__/
+backend/__pycache__/
+backend/temp_*.png
+backend/test_*.png
+backend/test_*.pdf
+backend/test_*.html
+test_opt.webp
+
+# Build and distribution outputs
+kot/dist/
+kot/release/
+dist/
+release/
+*.asar
+*.dll
+*.pak
+*.dat
+*.bin
